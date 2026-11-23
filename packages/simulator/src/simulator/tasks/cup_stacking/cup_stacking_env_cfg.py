@@ -1,0 +1,183 @@
+import math
+
+import isaaclab.sim as sim_utils
+import torch
+
+from isaaclab.assets import AssetBaseCfg, RigidObject, RigidObjectCfg
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.sim.schemas import MassPropertiesCfg
+from isaaclab.utils import configclass
+
+from leisaac.utils.general_assets import parse_usd_and_create_subassets
+from leisaac.utils.domain_randomization import domain_randomization
+from simulator import ASSETS_ROOT
+from simulator.assets.scenes.kitchen import KITCHEN_CFG, KITCHEN_USD_PATH
+from simulator.utils.domain_randomization import (
+    randomize_light_conditions,
+    choose_object_reference_forms,
+    randomize_objects_apart,
+)
+
+from simulator.tasks.template.single_arm_franka_cfg import (
+    SingleArmFrankaObservationsCfg,
+    SingleArmFrankaTaskEnvCfg,
+    SingleArmFrankaTaskSceneCfg,
+    SingleArmFrankaTerminationsCfg,
+)
+
+KITCHEN_OBJECTS_ROOT = ASSETS_ROOT / "scenes" / "kitchen" / "objects"
+
+
+@configclass
+class CupStackingSceneCfg(SingleArmFrankaTaskSceneCfg):
+    """Scene configuration for the custom task."""
+
+    scene: AssetBaseCfg = KITCHEN_CFG.replace(prim_path="{ENV_REGEX_NS}/Scene")
+    # RectLight baked into the scene USD (/root/RectLight), as in eval/; wrap the existing prim so it can be
+    # randomized and recorded (recorded_light_names).
+    rect_light: AssetBaseCfg = AssetBaseCfg(prim_path="{ENV_REGEX_NS}/Scene/RectLight")
+
+    blue_cup: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Scene/blue_cup",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=str(KITCHEN_OBJECTS_ROOT / "BlueCup" / "BlueCup.usd"),
+            mass_props=MassPropertiesCfg(mass=0.1),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(8.95, 6.52, 1.0), rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+
+    pink_cup: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Scene/pink_cup",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=str(KITCHEN_OBJECTS_ROOT / "PinkCup" / "PinkCup.usd"),
+            mass_props=MassPropertiesCfg(mass=0.1),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(9.07, 6.43, 1.0), rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+
+
+def blue_cup_on_top_pink_cup(
+    env,
+    blue_cup_cfg: SceneEntityCfg,
+    pink_cup_cfg: SceneEntityCfg,
+    xy_tolerance: float,
+    z_range: tuple[float, float],
+) -> torch.Tensor:
+    """Success: blue cup centred on the pink cup within ``xy_tolerance`` in x and y, and its root
+    ``z_range`` above the pink cup's root."""
+    blue_cup: RigidObject = env.scene[blue_cup_cfg.name]
+    pink_cup: RigidObject = env.scene[pink_cup_cfg.name]
+
+    offset = blue_cup.data.root_pos_w - pink_cup.data.root_pos_w
+    done = torch.all(torch.abs(offset[:, :2]) <= xy_tolerance, dim=1)
+    done = torch.logical_and(done, offset[:, 2] >= z_range[0])
+    done = torch.logical_and(done, offset[:, 2] <= z_range[1])
+    return done
+
+
+@configclass
+class TerminationsCfg(SingleArmFrankaTerminationsCfg):
+    """Termination configuration for the custom task."""
+
+    success = DoneTerm(
+        func=blue_cup_on_top_pink_cup,
+        params={
+            "blue_cup_cfg": SceneEntityCfg("blue_cup"),
+            "pink_cup_cfg": SceneEntityCfg("pink_cup"),
+            "xy_tolerance": 0.02,
+            "z_range": (0.08, 0.10),
+        },
+    )
+
+
+@configclass
+class CupStackingEnvCfg(SingleArmFrankaTaskEnvCfg):
+    """Configuration for the custom task environment."""
+
+    scene: CupStackingSceneCfg = CupStackingSceneCfg(env_spacing=15.0)  # kitchen is 12.1 m x 7.0 m; envs must not overlap
+    observations: SingleArmFrankaObservationsCfg = SingleArmFrankaObservationsCfg()
+    terminations: TerminationsCfg = TerminationsCfg()
+    task_description: str = "pick up the blue cup and place it on the pink cup."  # set from the template
+    tracked_object_names: list[str] = ["blue_cup", "pink_cup"]
+    recorded_light_names: list[str] = ["rect_light"]
+    # Object Properties axis (STAR-Gen S-PROP): how the task text refers to each object, {form: phrase}.
+    # The objects never change; only the words do. "name" refers by name, "color" by color only.
+    # reference_weights sets how often each form is used (one form per episode, for every object).
+    object_references: dict[str, dict[str, str]] = {
+        "blue_cup": {"name": "blue cup", "color": "blue object"},
+        "pink_cup": {"name": "pink cup", "color": "pink object"},
+    }
+    reference_weights: dict[str, float] = {"name": 1.0, "color": 0.0}
+    task_description_template: str = "pick up the {blue_cup} and place it on the {pink_cup}."
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.episode_length_s = 20  # graded episode length for this task
+
+        self.viewer.eye = (0.8, 0.87, 0.67)
+        self.viewer.lookat = (0.4, -1.3, -0.2)
+        self.dynamic_reset_gripper_effort_limit = False
+
+        self.scene.robot.init_state.pos = (9.0, 6.0, 0.9)
+        self.scene.robot.init_state.rot = (0.707, 0.0, 0.0, 0.707)
+
+        # Per-task front camera: pos (7.2,6.2,1.45), aimed at (9,6.45,1.05)
+        # over the cup spawn. rot is that look-at as an opengl quaternion
+        # (w,x,y,z).
+        # The other two tasks put the camera on the far side of the objects
+        # looking back at the arm; the kitchen has no room for that -- the arm
+        # faces +y into the backsplash (wall at y~6.8) and wall cabinets close
+        # in above z~1.3 from x~8.0 on -- so this is a raised three-quarter
+        # view from the arm's left, clearing the cabinets and framing the whole
+        # +-0.15 m cup jitter box with the arm entering from frame right.
+        self.scene.front.offset.pos = (7.80362, 6.78599, 1.1197)
+        self.scene.front.offset.rot = (0.37025, 0.37025, -0.60242, -0.60242)
+        self.scene.front.offset.convention = "opengl"
+        self.scene.front.spawn.focal_length = 18.14756
+
+        self.scene.robot.init_state.joint_pos = {
+            "panda_joint1": 0.0,
+            "panda_joint2": -math.pi / 4.0,
+            "panda_joint3": 0.0,
+            "panda_joint4": -3.0 * math.pi / 4.0,
+            "panda_joint5": 0.0,
+            "panda_joint6": math.pi / 2.0,
+            "panda_joint7": math.pi / 4.0,
+            "panda_finger_joint1": 0.04,
+            "panda_finger_joint2": 0.04,
+        }
+
+        parse_usd_and_create_subassets(KITCHEN_USD_PATH, self)
+
+        domain_randomization(
+            self,
+            random_options=[
+                # Resample when the cups land closer than 11 cm (they would overlap).
+                randomize_objects_apart(
+                    pose_ranges={
+                        "blue_cup": {
+                            "x": (-0.05, 0.05),
+                            "y": (-0.05, 0.05),
+                            "z": (0.0, 0.0),
+                        },
+                        "pink_cup": {
+                            "x": (0.02, 0.05),
+                            "y": (0.02, 0.05),
+                            "z": (0.0, 0.0),
+                        },
+                    },
+                    min_distance=0.11,
+                ),
+                # The scene's RectLight, the light the evaluation files randomize. Choose the ranges your data
+                # should cover; the evaluation files use intensity 2500-8000 and 3000-6500 K.
+                randomize_light_conditions(
+                    "rect_light",
+                    intensity_range=(4500.0, 5500.0),
+                    color_variation=0.0,
+                    textures=[],
+                    color_temperature_range=(5300.0, 5900.0),
+                ),
+                choose_object_reference_forms(self.reference_weights),
+            ],
+        )

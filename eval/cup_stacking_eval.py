@@ -1,0 +1,175 @@
+import math
+
+import torch
+import gymnasium as gym
+import isaaclab.sim as sim_utils
+from isaaclab.utils.seed import configure_seed
+
+from isaaclab.assets import AssetBaseCfg, RigidObject, RigidObjectCfg
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.sim.schemas import MassPropertiesCfg
+from isaaclab.utils import configclass
+
+from leisaac.utils.general_assets import parse_usd_and_create_subassets
+from leisaac.utils.domain_randomization import domain_randomization
+from simulator import ASSETS_ROOT
+from simulator.assets.scenes.kitchen import KITCHEN_CFG, KITCHEN_USD_PATH
+from simulator.utils.domain_randomization import (
+    randomize_light_conditions,
+    choose_object_reference_forms,
+    randomize_objects_apart,
+)
+
+from simulator.tasks.template.single_arm_franka_cfg import (
+    SingleArmFrankaObservationsCfg,
+    SingleArmFrankaTaskEnvCfg,
+    SingleArmFrankaTaskSceneCfg,
+    SingleArmFrankaTerminationsCfg,
+)
+
+KITCHEN_OBJECTS_ROOT = ASSETS_ROOT / "scenes" / "kitchen" / "objects"
+
+
+configure_seed(42)
+
+@configclass
+class CupStackingEvalSceneCfg(SingleArmFrankaTaskSceneCfg):
+    scene: AssetBaseCfg = KITCHEN_CFG.replace(prim_path="{ENV_REGEX_NS}/Scene")
+    # RectLight baked into nycu_light_collider_wooden.usd (/root/RectLight); wrap the existing prim.
+    rect_light: AssetBaseCfg = AssetBaseCfg(prim_path="{ENV_REGEX_NS}/Scene/RectLight")
+    blue_cup: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Scene/blue_cup",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=str(KITCHEN_OBJECTS_ROOT / "BlueCup" / "BlueCup.usd"),
+            mass_props=MassPropertiesCfg(mass=0.1),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(8.90, 6.48, 1.0), rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+    pink_cup: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Scene/pink_cup",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=str(KITCHEN_OBJECTS_ROOT / "PinkCup" / "PinkCup.usd"),
+            mass_props=MassPropertiesCfg(mass=0.1),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(9.10, 6.48, 1.0), rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+
+
+# Success when blue cup centered over pink cup within xy tolerance and above by height_threshold.
+def blue_cup_on_top_pink_cup(
+    env,
+    blue_cup_cfg: SceneEntityCfg,
+    pink_cup_cfg: SceneEntityCfg,
+    xy_tolerance: float,
+    z_range: tuple[float, float],
+) -> torch.Tensor:
+    """Success: blue cup centred on the pink cup within ``xy_tolerance`` in x and y, and its root
+    ``z_range`` above the pink cup's root."""
+    blue_cup: RigidObject = env.scene[blue_cup_cfg.name]
+    pink_cup: RigidObject = env.scene[pink_cup_cfg.name]
+
+    offset = blue_cup.data.root_pos_w - pink_cup.data.root_pos_w
+    done = torch.all(torch.abs(offset[:, :2]) <= xy_tolerance, dim=1)
+    done = torch.logical_and(done, offset[:, 2] >= z_range[0])
+    done = torch.logical_and(done, offset[:, 2] <= z_range[1])
+    return done
+
+
+@configclass
+class EvalTerminationsCfg(SingleArmFrankaTerminationsCfg):
+    success = DoneTerm(
+        func=blue_cup_on_top_pink_cup,
+        params={
+            "blue_cup_cfg": SceneEntityCfg("blue_cup"),
+            "pink_cup_cfg": SceneEntityCfg("pink_cup"),
+            "xy_tolerance": 0.02,
+            "z_range": (0.08, 0.10),
+        },
+    )
+
+
+@configclass
+class CupStackingEvalEnvCfg(SingleArmFrankaTaskEnvCfg):
+    scene: CupStackingEvalSceneCfg = CupStackingEvalSceneCfg(env_spacing=15.0)  # kitchen is 12.1 m x 7.0 m; envs must not overlap
+    observations: SingleArmFrankaObservationsCfg = SingleArmFrankaObservationsCfg()
+    terminations: EvalTerminationsCfg = EvalTerminationsCfg()
+    task_description: str = "pick up the blue cup and place it on the pink cup."  # set from the template
+    tracked_object_names: list[str] = ["blue_cup", "pink_cup"]
+    recorded_light_names: list[str] = ["rect_light"]
+    # Object Properties axis (STAR-Gen S-PROP): phrases as in the task configuration; evaluation uses
+    # the name form and the color form equally often. The objects never change.
+    object_references: dict[str, dict[str, str]] = {
+        "blue_cup": {"name": "blue cup", "color": "blue object"},
+        "pink_cup": {"name": "pink cup", "color": "pink object"},
+    }
+    reference_weights: dict[str, float] = {"name": 0.5, "color": 0.5}
+    task_description_template: str = "pick up the {blue_cup} and place it on the {pink_cup}."
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.episode_length_s = 20  # graded episode length for this task
+
+        self.viewer.eye = (0.8, 0.87, 0.67)
+        self.viewer.lookat = (0.4, -1.3, -0.2)
+        self.dynamic_reset_gripper_effort_limit = False
+
+        self.scene.robot.init_state.pos = (9.0, 6.0, 0.9)
+        self.scene.robot.init_state.rot = (0.707, 0.0, 0.0, 0.707)
+        self.scene.robot.init_state.joint_pos = {
+            "panda_joint1": 0.0,
+            "panda_joint2": -math.pi / 4.0,
+            "panda_joint3": 0.0,
+            "panda_joint4": -3.0 * math.pi / 4.0,
+            "panda_joint5": 0.0,
+            "panda_joint6": math.pi / 2.0,
+            "panda_joint7": math.pi / 4.0,
+            "panda_finger_joint1": 0.04,
+            "panda_finger_joint2": 0.04,
+        }
+
+        self.scene.front.offset.pos = (7.80362, 6.78599, 1.1197)
+        self.scene.front.offset.rot = (0.37025, 0.37025, -0.60242, -0.60242)
+        self.scene.front.offset.convention = "opengl"
+        self.scene.front.spawn.focal_length = 18.14756
+
+        parse_usd_and_create_subassets(KITCHEN_USD_PATH, self)
+
+        domain_randomization(
+            self,
+            random_options=[
+                # Cups start 20 cm apart; resample when they land closer than 11 cm (they would overlap).
+                randomize_objects_apart(
+                    pose_ranges={
+                        "blue_cup": {
+            "x": (-0.1, 0.1),
+            "y": (-0.1, 0.1),
+            "z": (0.0, 0.0),
+        },
+                        "pink_cup": {
+            "x": (-0.1, 0.1),
+            "y": (-0.1, 0.1),
+            "z": (0.0, 0.0),
+        },
+                    },
+                    min_distance=0.11,
+                ),
+                randomize_light_conditions(
+                    "rect_light",
+                    intensity_range=(2500.0, 8000.0),
+                    color_variation=0.0,
+                    textures=[],
+                    color_temperature_range=(3000.0, 6500.0),
+                ),
+                choose_object_reference_forms(self.reference_weights),
+            ],
+        )
+
+TASK_ID = "Public-CupStacking-Eval-v0"
+
+gym.register(
+    id=TASK_ID,
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": f"{__name__}:CupStackingEvalEnvCfg"},
+)

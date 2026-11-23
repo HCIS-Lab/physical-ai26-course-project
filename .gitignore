@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+.venv-sim/
+build/
+dist/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+
+# Runtime directories
+data/*
+!data/.gitkeep
+checkpoints/*
+!checkpoints/.gitkeep
+outputs/
+
+# Workspace member outputs
+packages/simulator/**/output/
+packages/simulator/**/outputs/
+packages/simulator/**/videos/
+packages/simulator/**/wandb/
+
+# IsaacLab submodule build artifacts
+dependencies/IsaacLab/logs/
+dependencies/IsaacLab/outputs/
+dependencies/IsaacLab/_isaac_sim
+dependencies/IsaacLab/**/__pycache__/
+dependencies/IsaacLab/**/*.egg-info/
+
+
+datasets/*
+
+# Verification stores (scripts/store.py), one per dataset
+stores/*
+
+# Private external task files
+private_tasks/*
+!private_tasks/.gitkeep

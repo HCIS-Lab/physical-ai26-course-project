@@ -1,0 +1,732 @@
+# Synchronous LeRobot rollout script for LeIsaac.
+# Derived partially from upstream LeIsaac
+# `scripts/evaluation/policy_inference.py`
+# (https://github.com/LightwheelAI/leisaac/blob/main/scripts/evaluation/policy_inference.py
+# @ SHA 6b933e80786a69eb27d47503d11725c9c846566e), trimmed to local LeRobot
+# inference and extended with a dual-viewport setup, a debug shape printer,
+# and an in-process LeRobotSyncPolicy.
+
+"""Run local LeRobot policy inference in the same process as Isaac Sim."""
+
+"""Launch Isaac Sim Simulator first."""
+import json as _json
+import multiprocessing
+from pathlib import Path as _Path
+
+
+# Fields that newer LeRobot adds at training time but the inference-side
+# LeRobot installed in the worker image doesn't accept. They're all
+# training-only (LoRA, torch.compile, image-preproc) and safe to strip
+# from the checkpoint's config.json before from_pretrained() reads it.
+# Extend whenever draccus.utils.DecodingError surfaces a new field.
+_LEROBOT_INCOMPAT_CONFIG_FIELDS: tuple[str, ...] = (
+    "use_peft",
+    "resize_shape",
+    "crop_ratio",
+    "compile_model",
+    "compile_mode",
+)
+
+
+def _patch_lerobot_config(checkpoint_dir: str) -> None:
+    """Strip known-incompatible fields from <checkpoint>/config.json.
+
+    Idempotent — running twice is fine. Errors are swallowed; if config.json
+    is missing or unreadable the original from_pretrained call will still
+    surface a helpful message.
+    """
+    cfg_path = _Path(checkpoint_dir) / "config.json"
+    if not cfg_path.is_file():
+        return
+    try:
+        with cfg_path.open("r") as f:
+            cfg = _json.load(f)
+    except (OSError, ValueError) as exc:
+        print(f"[rollout] config.json read skipped: {exc}", flush=True)
+        return
+    stripped = [k for k in _LEROBOT_INCOMPAT_CONFIG_FIELDS if k in cfg]
+    if not stripped:
+        return
+    for k in stripped:
+        cfg.pop(k, None)
+    try:
+        with cfg_path.open("w") as f:
+            _json.dump(cfg, f, indent=2)
+        print(
+            f"[rollout] stripped LeRobot-incompatible config fields: {stripped}",
+            flush=True,
+        )
+    except OSError as exc:
+        print(f"[rollout] config.json patch skipped: {exc}", flush=True)
+
+
+
+
+if multiprocessing.get_start_method() != "spawn":
+    multiprocessing.set_start_method("spawn", force=True)
+
+import argparse
+
+from isaaclab.app import AppLauncher
+
+POLICY_TYPES = [
+    "lerobot-diffusion",
+    "lerobot-act",
+    "lerobot-smolvla",
+    "lerobot-pi0",
+    "lerobot-pi05",
+    "lerobot-vqbet",
+    "lerobot-tdmpc",
+    "lerobot-sac",
+    "lerobot-groot",
+    "lerobot-xvla",
+]
+
+parser = argparse.ArgumentParser(
+    description="Evaluate a local LeRobot checkpoint in the Isaac Lab simulation."
+)
+parser.add_argument(
+    "--task",
+    type=str,
+    default=None,
+    help="Task Gym id, evaluation .py file, or module:Class reference.",
+)
+parser.add_argument(
+    "--step_hz", type=int, default=60, help="Environment stepping rate in Hz."
+)
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=42,
+    help="Seed of the environment. Drives object-position and lighting randomization; keep fixed to replicate results.",
+)
+parser.add_argument(
+    "--episode_length_s",
+    type=float,
+    default=None,
+    help="Episode timeout in seconds. Defaults to the task's episode_length_s (the graded value for eval files).",
+)
+parser.add_argument(
+    "--eval_rounds",
+    type=int,
+    default=0,
+    help=(
+        "Number of evaluation rounds. 0 means don't add time out termination, policy will run until success or manual"
+        " reset."
+    ),
+)
+parser.add_argument(
+    "--policy_type",
+    type=str,
+    required=True,
+    choices=POLICY_TYPES,
+    help="Local LeRobot policy type: lerobot-<type>, where <type> is the --policy.type used in training.",
+)
+parser.add_argument(
+    "--policy_action_horizon",
+    type=int,
+    default=None,
+    help=(
+        "Number of actions executed per policy inference. Overrides n_action_steps of the checkpoint;"
+        " defaults to the checkpoint value."
+    ),
+)
+parser.add_argument(
+    "--policy_language_instruction",
+    type=str,
+    default=None,
+    help="Language instruction of the policy.",
+)
+parser.add_argument(
+    "--policy_checkpoint_path",
+    type=str,
+    required=True,
+    help="Path to the local LeRobot checkpoint.",
+)
+parser.add_argument(
+    "--debug_policy_shapes",
+    action="store_true",
+    help="Print observation and action tensor shapes around each local LeRobot inference call.",
+)
+parser.add_argument(
+    "--num_envs",
+    type=int,
+    default=1,
+    help=(
+        "Number of environments to simulate in parallel. Each round evaluates this many"
+        " episodes concurrently; the policy is batched across envs and reset between rounds."
+    ),
+)
+
+
+AppLauncher.add_app_launcher_args(parser)
+args_cli = parser.parse_args()
+
+app_launcher = AppLauncher(vars(args_cli))
+simulation_app = app_launcher.app
+
+import inspect
+import os
+import time
+import traceback
+from typing import Any
+
+import omni.ui as ui
+import omni.kit.app
+import omni.kit.viewport.utility as vp_util
+
+import carb
+import gymnasium as gym
+import numpy as np
+import omni
+import torch
+from isaaclab.envs import ManagerBasedRLEnv
+from isaaclab.sensors import Camera
+from isaaclab_tasks.utils import parse_env_cfg
+from lerobot.async_inference.helpers import raw_observation_to_observation
+from lerobot.policies.factory import get_policy_class, make_pre_post_processors
+from lerobot.policies.utils import populate_queues
+from lerobot.utils.constants import ACTION, OBS_IMAGES
+
+
+import leisaac  # noqa: F401
+import simulator.tasks  # noqa: F401
+from simulator.tasks.external import resolve_task
+from simulator import FRANKA_JOINT_NAMES
+from simulator.utils.rollout_log import RolloutLogWriter, asset_pose, file_sha256, start_factors
+
+
+def setup_dual_viewports():
+    """Setup dual viewports: wrist camera view and front camera view."""
+    perspective_path = "/World/envs/env_0/Robot/panda_hand/wrist"
+
+    # Get main viewport window
+    v1_window = ui.Workspace.get_window("Viewport")
+    if not v1_window:
+        print("Error: Main viewport window not found")
+        return
+
+    v1_api = vp_util.get_viewport_from_window_name("Viewport")
+    if v1_api:
+        v1_api.camera_path = perspective_path
+
+    # Get or create secondary viewport window
+    v2_window = ui.Workspace.get_window("Viewport 2")
+    if not v2_window:
+        v2_window = vp_util.create_viewport_window("Viewport 2")
+        # Important: Wait for UI to register the new window
+        omni.kit.app.get_app().update()  # Synchronous frame update
+
+    v2_api = vp_util.get_viewport_from_window_name("Viewport 2")
+    if v2_api:
+        v2_api.camera_path = "/World/envs/env_0/front_camera"
+
+    # Ensure both windows exist before docking
+    if v1_window and v2_window:
+        # Wait for UI to stabilize before docking
+        omni.kit.app.get_app().update()
+
+        # Attempt docking with error handling
+        try:
+            v2_window.dock_in(v1_window, ui.DockPosition.RIGHT)
+            print("Viewports docked: [Viewport (Persp)] | [Viewport 2 (Camera)]")
+        except Exception as e:
+            print(f"Docking failed: {str(e)}")
+            # Alternative docking approach if direct docking fails
+            try:
+                # Try docking after another frame
+                omni.kit.app.get_app().update()
+                v2_window.dock_in(v1_window, ui.DockPosition.RIGHT)
+                print("Viewports docked on second attempt")
+            except Exception as e2:
+                print(f"Second docking attempt failed: {str(e2)}")
+    else:
+        print("Error: Could not find one or both viewport windows for docking.")
+
+
+class RateLimiter:
+    """Convenience class for enforcing rates in loops."""
+
+    def __init__(self, hz):
+        self.hz = hz
+        self.last_time = time.time()
+        self.sleep_duration = 1.0 / hz
+        self.render_period = min(0.0166, self.sleep_duration)
+
+    def sleep(self, env):
+        next_wakeup_time = self.last_time + self.sleep_duration
+        while time.time() < next_wakeup_time:
+            time.sleep(self.render_period)
+            env.sim.render()
+
+        self.last_time = self.last_time + self.sleep_duration
+        if self.last_time < time.time():
+            while self.last_time < time.time():
+                self.last_time += self.sleep_duration
+
+
+class Controller:
+    def __init__(self):
+        self._appwindow = omni.appwindow.get_default_app_window()
+        self._input = carb.input.acquire_input_interface()
+        self._keyboard = self._appwindow.get_keyboard()
+        self._keyboard_sub = self._input.subscribe_to_keyboard_events(
+            self._keyboard,
+            self._on_keyboard_event,
+        )
+        self.reset_state = False
+
+    def __del__(self):
+        if (
+            hasattr(self, "_input")
+            and hasattr(self, "_keyboard")
+            and hasattr(self, "_keyboard_sub")
+        ):
+            self._input.unsubscribe_from_keyboard_events(
+                self._keyboard, self._keyboard_sub
+            )
+            self._keyboard_sub = None
+
+    def reset(self):
+        self.reset_state = False
+
+    def _on_keyboard_event(self, event, *args, **kwargs):
+        if event.type == carb.input.KeyboardEventType.KEY_PRESS:
+            if event.input.name == "R":
+                self.reset_state = True
+        return True
+
+
+def _shape_summary(value: Any) -> str:
+    if isinstance(value, torch.Tensor):
+        return f"Tensor(shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device})"
+    if isinstance(value, np.ndarray):
+        return f"ndarray(shape={value.shape}, dtype={value.dtype})"
+    return type(value).__name__
+
+
+def _print_mapping_shapes(title: str, values: dict[str, Any]) -> None:
+    print(title)
+    for key in sorted(values):
+        print(f"  {key}: {_shape_summary(values[key])}")
+
+
+class LeRobotSyncPolicy:
+    """Local LeRobot inference path matching the async server pipeline."""
+
+    def __init__(
+        self,
+        policy_type: str,
+        pretrained_name_or_path: str,
+        camera_infos: dict[str, tuple[int, int]],
+        actions_per_chunk: int | None,
+        device: str,
+        debug_policy_shapes: bool = False,
+    ):
+        self.device = device
+        self.debug_policy_shapes = debug_policy_shapes
+        self.state_joint_names = FRANKA_JOINT_NAMES
+        self.action_dim = 8
+
+        self.lerobot_features = self._build_lerobot_features(camera_infos)
+        self.camera_keys = list(camera_infos.keys())
+
+        print(
+            f"Loading local LeRobot policy '{policy_type}' from {pretrained_name_or_path}...",
+            flush=True,
+        )
+        # Strip training-only fields that newer LeRobot adds but the
+        # inference-side LeRobot doesn't accept. Safe because these flags
+        # never affect inference. See _patch_lerobot_config above.
+        _patch_lerobot_config(pretrained_name_or_path)
+        policy_class = get_policy_class(policy_type)
+        self.policy = policy_class.from_pretrained(pretrained_name_or_path, local_files_only=True)
+        self.policy.to(device)
+        self.policy.eval()
+        if actions_per_chunk is not None:
+            self._override_n_action_steps(actions_per_chunk)
+        print(f"[SyncPolicy] {self._config_horizon_summary()}", flush=True)
+
+        device_override = {"device": device}
+        self.preprocessor, self.postprocessor = make_pre_post_processors(
+            self.policy.config,
+            pretrained_path=pretrained_name_or_path,
+            preprocessor_overrides={
+                "device_processor": device_override,
+                "rename_observations_processor": {"rename_map": {}},
+            },
+            postprocessor_overrides={"device_processor": device_override},
+        )
+        print("Local LeRobot policy is ready.", flush=True)
+
+    def _override_n_action_steps(self, n_action_steps: int) -> None:
+        """Replace n_action_steps of the loaded checkpoint, within the limits the policy supports."""
+        config = self.policy.config
+        if not hasattr(config, "n_action_steps"):
+            raise ValueError(
+                f"--policy_action_horizon is not supported by '{config.type}': its config has no n_action_steps."
+            )
+        if n_action_steps <= 0:
+            raise ValueError(f"--policy_action_horizon must be positive, got {n_action_steps}.")
+        if getattr(config, "temporal_ensemble_coeff", None) is not None and n_action_steps != 1:
+            raise ValueError("--policy_action_horizon must be 1 for ACT with temporal ensembling.")
+        if hasattr(config, "horizon") and hasattr(config, "n_obs_steps"):
+            # Diffusion Policy keeps actions[n_obs_steps - 1 : n_obs_steps - 1 + n_action_steps] of the horizon.
+            max_steps = config.horizon - config.n_obs_steps + 1
+        else:
+            max_steps = getattr(config, "chunk_size", None)
+        if max_steps is not None and n_action_steps > max_steps:
+            raise ValueError(
+                f"--policy_action_horizon={n_action_steps} exceeds the {max_steps} actions that one inference of"
+                f" this checkpoint predicts."
+            )
+        print(
+            f"[SyncPolicy] n_action_steps: checkpoint {config.n_action_steps} -> override {n_action_steps}",
+            flush=True,
+        )
+        config.n_action_steps = n_action_steps
+        # The action queues are sized from n_action_steps, so rebuild them.
+        self.reset()
+
+    def reset(self):
+        policy_reset = getattr(self.policy, "reset", None)
+        if callable(policy_reset):
+            policy_reset()
+
+    def _build_lerobot_features(
+        self, camera_infos: dict[str, tuple[int, int]]
+    ) -> dict[str, dict]:
+        features = {
+            "observation.state": {
+                "dtype": "float32",
+                "shape": (len(self.state_joint_names),),
+                "names": [f"{joint_name}.pos" for joint_name in self.state_joint_names],
+            }
+        }
+        for camera_key, camera_image_shape in camera_infos.items():
+            features[f"observation.images.{camera_key}"] = {
+                "dtype": "image",
+                "shape": (camera_image_shape[0], camera_image_shape[1], 3),
+                "names": ["height", "width", "channels"],
+            }
+        return features
+
+    def _build_raw_observation(
+        self, observation_dict: dict, env_index: int
+    ) -> dict[str, Any]:
+        raw_observation = {
+            key: observation_dict[key].cpu().numpy().astype(np.uint8)[env_index]
+            for key in self.camera_keys
+        }
+        task = observation_dict["task_description"]
+        # One text for every env, or one per env (the colors named in the text differ between envs).
+        raw_observation["task"] = task[env_index] if isinstance(task, list) else task
+
+        joint_pos = observation_dict["joint_pos"].cpu().numpy()
+
+        for joint_index, joint_name in enumerate(self.state_joint_names):
+            raw_observation[f"{joint_name}.pos"] = joint_pos[env_index, joint_index].item()
+
+        return raw_observation
+
+    def _collate_observations(self, obs_list: list[dict[str, Any]]) -> dict[str, Any]:
+        """Stack per-env prepared observations into a single batched observation.
+
+        Each entry in ``obs_list`` carries a leading batch dim of 1 (one env),
+        so tensors concatenate along dim 0 into a (num_envs, ...) batch that the
+        policy's ``select_action`` consumes in one call — keeping its internal
+        action/observation queues batch-consistent across envs.
+        """
+        if len(obs_list) == 1:
+            return obs_list[0]
+        collated: dict[str, Any] = {}
+        for key in obs_list[0]:
+            values = [obs[key] for obs in obs_list]
+            first = values[0]
+            if isinstance(first, torch.Tensor):
+                collated[key] = torch.cat(values, dim=0)
+            elif isinstance(first, list):
+                collated[key] = [item for value in values for item in value]
+            else:
+                collated[key] = values
+        return collated
+
+    def _config_horizon_summary(self) -> str:
+        names = ["chunk_size", "n_action_steps", "action_chunk_size", "action_horizon"]
+        values = []
+        for name in names:
+            if hasattr(self.policy.config, name):
+                values.append(f"{name}={getattr(self.policy.config, name)}")
+        return ", ".join(values) if values else "no known horizon fields found"
+
+    def _prepare_observation(self, raw_observation: dict[str, Any]) -> dict[str, Any]:
+        observation = raw_observation_to_observation(
+            raw_observation,
+            self.lerobot_features,
+            self.policy.config.image_features,
+        )
+        if self.debug_policy_shapes:
+            _print_mapping_shapes("[SyncPolicy] Prepared observation:", observation)
+
+        observation = self.preprocessor(observation)
+        if self.debug_policy_shapes:
+            _print_mapping_shapes("[SyncPolicy] Preprocessed observation:", observation)
+        return observation
+
+    def _predict_lerobot_actions(self, observation: dict[str, Any]) -> torch.Tensor:
+        with torch.inference_mode():
+            action = self.policy.select_action(observation)
+        return self.postprocessor(action)
+
+    def _convert_actions_to_leisaac(self, action_tensor: torch.Tensor) -> np.ndarray:
+        actions = action_tensor.to("cpu").numpy()
+        if actions.shape[-1] != self.action_dim:
+            raise ValueError(f"Expected {self.action_dim} action values, got {actions.shape[-1]}.")
+        return actions
+
+    def get_action(self, observation_dict: dict) -> torch.Tensor:
+        num_envs = observation_dict["joint_pos"].shape[0]
+        obs_batch = []
+        for env_index in range(num_envs):
+            raw_observation = self._build_raw_observation(observation_dict, env_index)
+            if self.debug_policy_shapes and env_index == 0:
+                _print_mapping_shapes("[SyncPolicy] Raw observation (env 0):", raw_observation)
+            obs_batch.append(self._prepare_observation(raw_observation))
+
+        observation = self._collate_observations(obs_batch)
+        action_tensor = self._predict_lerobot_actions(observation)
+        actions = self._convert_actions_to_leisaac(action_tensor)
+        # actions: (num_envs, action_dim) — one action per env for this step.
+        return torch.from_numpy(actions)
+
+
+def preprocess_obs_dict(obs_dict: dict, language_instruction: str):
+    obs_dict["task_description"] = language_instruction
+    return obs_dict
+
+
+def get_policy_type(policy_type_arg: str) -> str:
+    if not policy_type_arg.startswith("lerobot-"):
+        raise ValueError(
+            f"rollout.py only supports local LeRobot policies, got '{policy_type_arg}'. "
+            "Use --policy_type=lerobot-<type>."
+        )
+    return policy_type_arg.split("lerobot-", 1)[1]
+
+
+def get_camera_infos(
+    env: ManagerBasedRLEnv, policy_obs_dict: dict
+) -> dict[str, tuple[int, int]]:
+    camera_infos = {}
+    for key, sensor in env.scene.sensors.items():
+        if isinstance(sensor, Camera) and key in policy_obs_dict:
+            camera_infos[key] = sensor.image_shape
+    return camera_infos
+
+
+def _repo_relative(path: str) -> str:
+    relative = os.path.relpath(path)
+    return path if relative.startswith("..") else relative
+
+
+def open_rollout_log(env_cfg, task_id: str, env) -> RolloutLogWriter:
+    """Start the per-episode log outputs/rollout/<timestamp>.jsonl, read by `store.py ingest --rollout-log`.
+
+    Call after the first reset: the header records the robot base and fixed object poses, which never change.
+    It also records the eval file path and its SHA-256, so a log can be traced back to the exact eval settings.
+    """
+    eval_file = _repo_relative(inspect.getsourcefile(type(env_cfg)))
+    eval_sha = file_sha256(eval_file)
+    path = os.path.join("outputs", "rollout", f"{time.strftime('%Y%m%d-%H%M%S')}.jsonl")
+    header = {
+        "eval_file": eval_file,
+        "eval_sha256": eval_sha,
+        "task": task_id,
+        "seed": args_cli.seed,
+        "checkpoint": args_cli.policy_checkpoint_path,
+        "num_envs": args_cli.num_envs,
+        "episode_length_s": env_cfg.episode_length_s,
+        "robot_base": asset_pose(env.scene, "robot"),
+        "fixed_objects": {name: asset_pose(env.scene, name) for name in getattr(env_cfg, "fixed_object_names", [])},
+    }
+    writer = RolloutLogWriter(path, header)
+    print(f"[rollout] per-episode log: {writer.path}", flush=True)
+
+    return writer
+
+
+def main():
+    task_id = resolve_task(args_cli.task)
+    args_cli.task = task_id
+    env_cfg = parse_env_cfg(task_id, device=args_cli.device, num_envs=args_cli.num_envs)
+    robot_name = getattr(env_cfg, "robot_name", None)
+    if robot_name != "franka_panda":
+        raise ValueError(f"rollout.py supports Franka Panda tasks only, got robot_name={robot_name!r}.")
+    # Same action space and robot settings as data collection.
+    env_cfg.use_joint_position_actions()
+    env_cfg.seed = args_cli.seed
+    print(f"[rollout] seed = {env_cfg.seed}", flush=True)
+    if args_cli.episode_length_s is not None:
+        env_cfg.episode_length_s = args_cli.episode_length_s
+    print(f"[rollout] episode_length_s = {env_cfg.episode_length_s}", flush=True)
+
+    if args_cli.eval_rounds <= 0:
+        if hasattr(env_cfg.terminations, "time_out"):
+            env_cfg.terminations.time_out = None
+    max_episode_count = args_cli.eval_rounds
+    env_cfg.recorders = None
+
+    env: ManagerBasedRLEnv = gym.make(task_id, cfg=env_cfg).unwrapped
+
+    # Warm up the renderer before the first reset. Headless Isaac Sim with
+    # camera observations otherwise hangs the first env.reset() while the
+    # Vulkan / DLSS / shader pipeline compiles — the worker sees no output
+    # for several minutes and the eval looks dead. A handful of app updates
+    # forces shader compilation and material warm-up to happen here, where
+    # we can attribute it.
+    print("[rollout] warming up renderer (20 app updates)...", flush=True)
+    for _ in range(20):
+        simulation_app.update()
+    print("[rollout] resetting environment...", flush=True)
+    # Every env interaction -- reset included -- must run under inference_mode.
+    # IsaacLab's asset data buffers (e.g. RigidObjectData.root_link_pose_w) are
+    # lazily refilled from PhysX on first access after a sim step, so whichever
+    # mode the *step* runs in decides whether those cached tensors are inference
+    # tensors. A reset outside inference_mode then does an in-place write
+    # (`self._data.root_link_pose_w[env_ids] = ...`) on an inference tensor and
+    # raises "Inplace update to inference tensor outside InferenceMode".
+    with torch.inference_mode():
+        obs_dict, _ = env.reset()
+        rollout_log = open_rollout_log(env_cfg, task_id, env)
+    print("[rollout] env.reset() returned", flush=True)
+
+    def instructions():
+        """The task text per env after a reset: --policy_language_instruction for all, or each env's own text."""
+        if args_cli.policy_language_instruction is not None:
+            return args_cli.policy_language_instruction
+        if hasattr(env_cfg, "task_text"):
+            return [env_cfg.task_text(env, e) for e in range(env.num_envs)]
+        return getattr(env_cfg, "task_description", None)
+
+    language_instruction = instructions()
+    policy_obs_dict = preprocess_obs_dict(obs_dict["policy"], language_instruction)
+    camera_infos = get_camera_infos(env, policy_obs_dict)
+    print(
+        f"[rollout] camera_infos = {camera_infos}; loading policy...",
+        flush=True,
+    )
+
+    policy = LeRobotSyncPolicy(
+        policy_type=get_policy_type(args_cli.policy_type),
+        pretrained_name_or_path=args_cli.policy_checkpoint_path,
+        camera_infos=camera_infos,
+        actions_per_chunk=args_cli.policy_action_horizon,
+        device=args_cli.device,
+        debug_policy_shapes=args_cli.debug_policy_shapes,
+    )
+
+    rate_limiter = RateLimiter(args_cli.step_hz)
+    controller = Controller()
+    controller.reset()
+
+    setup_dual_viewports()
+
+
+    # Parallel evaluation runs `num_envs` episodes per synchronized round. All
+    # envs reset together, step in lockstep on a batched policy call, and the
+    # policy is reset at each round boundary so its internal queues never mix
+    # state across episodes. IsaacLab auto-resets an env once it terminates, so
+    # we latch each env's FIRST outcome (success vs. time out) via `done_mask`
+    # and ignore any further activity until the round ends.
+    num_envs = env.num_envs
+    success_count, episodes_done = 0, 0
+    # The first round starts from the reset above, which already produced obs_dict.
+    needs_reset = False
+    while simulation_app.is_running():
+        if max_episode_count > 0 and episodes_done >= max_episode_count:
+            break
+        # Last round may need fewer than num_envs episodes; only count those.
+        batch = (
+            num_envs
+            if max_episode_count <= 0
+            else min(num_envs, max_episode_count - episodes_done)
+        )
+        print(
+            f"[Evaluation] Evaluating episodes {episodes_done + 1}-{episodes_done + batch} "
+            f"across {num_envs} parallel env(s)..."
+        )
+
+        if needs_reset:
+            with torch.inference_mode():
+                obs_dict, _ = env.reset()
+        needs_reset = True
+        # Initial positions and lighting of this round's episodes, right after the reset randomized them.
+        with torch.inference_mode():
+            round_factors = start_factors(env.scene, env_cfg, range(batch))
+        language_instruction = instructions()
+        policy.reset()
+        controller.reset()
+        done_mask = torch.zeros(num_envs, dtype=torch.bool, device=env.device)
+        success_mask = torch.zeros(num_envs, dtype=torch.bool, device=env.device)
+
+        while simulation_app.is_running():
+            with torch.inference_mode():
+                if controller.reset_state:
+                    controller.reset()
+                    break
+
+                policy_obs_dict = preprocess_obs_dict(
+                    obs_dict["policy"], language_instruction
+                )
+                actions = policy.get_action(policy_obs_dict).to(env.device)
+                obs_dict, _, reset_terminated, reset_time_outs, _ = env.step(actions)
+
+                newly_done = (reset_terminated | reset_time_outs) & ~done_mask
+                # A success DoneTerm reports via `terminated`; time out via `truncated`.
+                success_mask |= reset_terminated & newly_done
+                done_mask |= reset_terminated | reset_time_outs
+                if bool(done_mask.all()):
+                    break
+                if rate_limiter:
+                    rate_limiter.sleep(env)
+
+        for e in range(batch):
+            status = "succeeded" if success_mask[e] else "failed" if done_mask[e] else "aborted"
+            instruction = language_instruction[e] if isinstance(language_instruction, list) else language_instruction
+            rollout_log.write_episode(episodes_done + e, status, round_factors[e], instruction)
+        rollout_log.flush()
+
+        round_success = int(success_mask[:batch].sum().item())
+        success_count += round_success
+        episodes_done += batch
+        print(
+            f"[Evaluation] round done: {round_success}/{batch} succeeded; "
+            f"cumulative success rate: {success_count / episodes_done:.3f} "
+            f"[{success_count}/{episodes_done}]"
+        )
+
+    if max_episode_count > 0:
+        print(
+            f"[Evaluation] Final success rate: {success_count / max_episode_count:.3f} "
+            f" [{success_count}/{max_episode_count}]"
+        )
+
+    rollout_log.close()
+    print(
+        f"[rollout] per-episode log written to {rollout_log.path}; put it into your dataset's store, then verify:"
+        f" uv run python scripts/store.py ingest --store stores/<repo_name> --rollout-log {rollout_log.path}"
+        " && uv run python scripts/store.py verify --store stores/<repo_name>",
+        flush=True,
+    )
+
+    env.close()
+    simulation_app.close()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        traceback.print_exc()
+        # Isaac Sim can hang on shutdown after an error; exit hard so the shell sees the failure.
+        os._exit(1)

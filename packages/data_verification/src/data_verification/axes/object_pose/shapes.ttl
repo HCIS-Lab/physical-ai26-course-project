@@ -1,0 +1,228 @@
+# SHACL rules of the Object Poses axis, factor object position (dataset side; extends shapes/dataset.ttl).
+#
+# Severity:
+#   sh:Violation - dataset fails verification (malformed data, uncovered cell)
+#   sh:Warning   - reported, does not fail unless --strict (initial position
+#                  outside the required area: allowed, it just does not count)
+#
+# Verification starts from the cp:Dataset: its requirements are those of the
+# axes it has (cp:hasGeneralizationAxis), and only its own episodes
+# (cp:hasEpisode) count. Every episode of the dataset counts toward coverage;
+# the repo recorder (LeRobotRecorderManager) saves successful episodes only.
+#
+# Requirement objects and episode objects are both cp:TaskObject; they are
+# matched by cp:name. Queries use plain triple patterns, not property paths
+# (a/b/c): rdflib evaluates paths several times slower.
+
+@prefix cp:   <http://taica.course/cp/ontology#> .
+@prefix sh:   <http://www.w3.org/ns/shacl#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+
+cp: a owl:Ontology ;
+    sh:declare [ sh:prefix "cp" ; sh:namespace "http://taica.course/cp/ontology#"^^xsd:anyURI ] .
+
+# ---- Dataset: one initial position per required object ----------------------
+
+cp:ObjectPositionDatasetShape a sh:NodeShape ;
+    sh:targetClass cp:Dataset ;
+    sh:sparql [
+        sh:message "Episode {?index} has no initial position for required object '{?name}'" ;
+        sh:prefixes cp: ;
+        sh:select """
+            SELECT $this ?index ?name WHERE {
+                $this cp:hasEpisode ?episode ; cp:hasGeneralizationAxis ?axis .
+                ?episode cp:index ?index .
+                ?axis cp:hasRequirement ?req .
+                ?req a cp:ObjectPositionRequirement ; cp:hasTaskObject ?reqObj .
+                ?reqObj cp:name ?name .
+                FILTER NOT EXISTS {
+                    ?episode cp:hasTaskObject ?obj .
+                    ?obj cp:name ?name ; cp:hasPosition ?p .
+                }
+            }
+        """ ;
+    ] .
+
+# Severity is a property of the shape, so the area check gets its own shape.
+cp:DatasetAreaShape a sh:NodeShape ;
+    sh:targetClass cp:Dataset ;
+    sh:severity sh:Warning ;
+    sh:sparql [
+        sh:message "Episode {?index}: initial position of '{?name}' at ({?x}, {?y}) is outside the required area; it does not count toward coverage" ;
+        sh:prefixes cp: ;
+        sh:select """
+            SELECT $this ?index ?name ?x ?y WHERE {
+                $this cp:hasGeneralizationAxis ?axis ; cp:hasEpisode ?episode .
+                ?episode cp:index ?index .
+                ?axis cp:hasRequirement ?req .
+                ?req a cp:ObjectPositionRequirement ; cp:hasTaskObject ?reqObj ; cp:hasAreaConfiguration ?area .
+                ?reqObj cp:name ?name .
+                ?area cp:areaXMin ?x0 ; cp:areaXMax ?x1 ; cp:areaYMin ?y0 ; cp:areaYMax ?y1 .
+                ?episode cp:hasTaskObject ?obj .
+                ?obj cp:name ?name ; cp:hasPosition ?p .
+                ?p cp:positionX ?x ; cp:positionY ?y .
+                FILTER (?x < ?x0 || ?x > ?x1 || ?y < ?y0 || ?y > ?y1)
+            }
+        """ ;
+    ] .
+
+# ---- Axis and requirement: well-formed spec ----------------------------------
+
+cp:ObjectPositionAxisShape a sh:NodeShape ;
+    sh:targetClass cp:ObjectPoseAxis ;
+    sh:property [ sh:path cp:hasRequirement ; sh:class cp:ObjectPositionRequirement ; sh:minCount 1 ] .
+
+cp:ObjectPositionRequirementShape a sh:NodeShape ;
+    sh:targetClass cp:ObjectPositionRequirement ;
+    sh:property [
+        sh:path cp:hasTaskObject ;
+        sh:class cp:TaskObject ; sh:minCount 1 ; sh:maxCount 1 ;
+        sh:node cp:RequirementTaskObjectShape ;
+    ] ;
+    sh:property [ sh:path cp:hasAreaConfiguration ; sh:class cp:AreaConfiguration ; sh:minCount 1 ; sh:maxCount 1 ] ;
+    sh:property [ sh:path cp:minEpisodesPerCell ; sh:minCount 1 ; sh:maxCount 1 ; sh:minInclusive 1 ] ;
+    sh:property [
+        sh:path [ sh:inversePath cp:hasRequirement ] ; sh:maxCount 1 ;
+        sh:message "Requirement is linked from more than one axis (cp:hasRequirement); give each axis its own requirement" ;
+    ] ;
+    sh:sparql [
+        sh:message "Requirement is not linked from an ObjectPoseAxis (cp:hasRequirement)" ;
+        sh:prefixes cp: ;
+        sh:select """
+            SELECT $this WHERE {
+                FILTER NOT EXISTS { ?axis a cp:ObjectPoseAxis ; cp:hasRequirement $this . }
+            }
+        """ ;
+    ] .
+
+cp:RequirementTaskObjectShape a sh:NodeShape ;
+    sh:property [ sh:path cp:name ; sh:minCount 1 ; sh:maxCount 1 ] ;
+    sh:property [
+        sh:path cp:hasPosition ; sh:maxCount 0 ;
+        sh:message "A requirement's task object names the object only; it has no position" ;
+    ] .
+
+cp:AreaConfigurationShape a sh:NodeShape ;
+    sh:targetClass cp:AreaConfiguration ;
+    sh:property [
+        sh:path [ sh:inversePath cp:hasAreaConfiguration ] ; sh:class cp:ObjectPositionRequirement ; sh:minCount 1 ; sh:maxCount 1 ;
+        sh:message "Area must belong to exactly one requirement (cp:hasAreaConfiguration); give each requirement its own area" ;
+    ] ;
+    sh:property [ sh:path cp:areaXMin ; sh:minCount 1 ; sh:maxCount 1 ] ;
+    sh:property [ sh:path cp:areaXMax ; sh:minCount 1 ; sh:maxCount 1 ] ;
+    sh:property [ sh:path cp:areaYMin ; sh:minCount 1 ; sh:maxCount 1 ] ;
+    sh:property [ sh:path cp:areaYMax ; sh:minCount 1 ; sh:maxCount 1 ] ;
+    sh:property [ sh:path cp:hasCoverageGrid ; sh:class cp:CoverageGrid ; sh:minCount 1 ; sh:maxCount 1 ] ;
+    sh:sparql [
+        sh:message "Coverage area is empty: areaXMin must be < areaXMax and areaYMin < areaYMax" ;
+        sh:prefixes cp: ;
+        sh:select """
+            SELECT $this WHERE {
+                $this cp:areaXMin ?x0 ; cp:areaXMax ?x1 ; cp:areaYMin ?y0 ; cp:areaYMax ?y1 .
+                FILTER (?x0 >= ?x1 || ?y0 >= ?y1)
+            }
+        """ ;
+    ] .
+
+cp:CoverageGridShape a sh:NodeShape ;
+    sh:targetClass cp:CoverageGrid ;
+    sh:property [
+        sh:path [ sh:inversePath cp:hasCoverageGrid ] ; sh:class cp:AreaConfiguration ; sh:minCount 1 ; sh:maxCount 1 ;
+        sh:message "Grid must belong to exactly one area (cp:hasCoverageGrid); give each area its own grid" ;
+    ] ;
+    sh:property [ sh:path cp:numCellW ; sh:minCount 1 ; sh:maxCount 1 ; sh:minInclusive 1 ] ;
+    sh:property [ sh:path cp:numCellH ; sh:minCount 1 ; sh:maxCount 1 ; sh:minInclusive 1 ] ;
+    sh:sparql [
+        sh:message "Coverage grid has {?n} cell(s); numCellW * numCellH = {?expected}" ;
+        sh:prefixes cp: ;
+        sh:select """
+            SELECT $this ?expected (COUNT(DISTINCT ?cell) AS ?n) WHERE {
+                $this cp:numCellW ?w ; cp:numCellH ?h .
+                BIND (?w * ?h AS ?expected)
+                OPTIONAL { $this cp:hasCell ?cell . }
+            }
+            GROUP BY $this ?expected
+            HAVING (COUNT(DISTINCT ?cell) != ?expected)
+        """ ;
+    ] ;
+    sh:sparql [
+        sh:message "Coverage grid has more than one cell with index {?index}" ;
+        sh:prefixes cp: ;
+        sh:select """
+            SELECT DISTINCT $this ?index WHERE {
+                $this cp:hasCell ?c1, ?c2 .
+                ?c1 cp:index ?index . ?c2 cp:index ?index .
+                FILTER (?c1 != ?c2)
+            }
+        """ ;
+    ] ;
+    sh:sparql [
+        sh:message "Cell index {?index} is outside the grid (0 to numCellW * numCellH - 1)" ;
+        sh:prefixes cp: ;
+        sh:select """
+            SELECT $this ?index WHERE {
+                $this cp:numCellW ?w ; cp:numCellH ?h ; cp:hasCell ?cell .
+                ?cell cp:index ?index .
+                FILTER (?index >= ?w * ?h)
+            }
+        """ ;
+    ] .
+
+cp:CellShape a sh:NodeShape ;
+    sh:targetClass cp:Cell ;
+    sh:property [
+        sh:path [ sh:inversePath cp:hasCell ] ; sh:class cp:CoverageGrid ; sh:minCount 1 ; sh:maxCount 1 ;
+        sh:message "Cell must belong to exactly one coverage grid (cp:hasCell)" ;
+    ] ;
+    sh:property [ sh:path cp:index ; sh:datatype xsd:nonNegativeInteger ; sh:minCount 1 ; sh:maxCount 1 ] .
+
+# ---- Coverage: the rule itself, per cell of each dataset requirement --------
+# Cell k is column i = k mod numCellW, row j = floor(k / numCellW). Its bounds are
+# areaXMin + i * (areaXMax - areaXMin) / numCellW, and the same for y. A position
+# is in the cell when x0 <= x < x1 (x <= x1 on the last column), same for y.
+# Only the episodes of a dataset that has the requirement's axis count
+# (?dataset cp:hasGeneralizationAxis / cp:hasEpisode); a rollout's runs never do.
+# Cells with fewer episodes than minEpisodesPerCell fail. Cells of an empty area
+# are skipped (cp:AreaConfigurationShape reports the area). The rule is checked
+# per cell: one query per dataset is several times slower in rdflib.
+
+cp:CellCoverageShape a sh:NodeShape ;
+    sh:targetClass cp:Cell ;
+    sh:sparql [
+        sh:message "'{?name}' cell (i={?i}, j={?j}) x=[{?sx0}, {?sx1}] y=[{?sy0}, {?sy1}] has {?n} episode(s); needs at least {?min}" ;
+        sh:prefixes cp: ;
+        sh:select """
+            SELECT $this ?name ?i ?j ?sx0 ?sx1 ?sy0 ?sy1 ?min (COUNT(DISTINCT ?episode) AS ?n) WHERE {
+                $this cp:index ?k .
+                ?grid cp:hasCell $this ; cp:numCellW ?nw ; cp:numCellH ?nh .
+                ?area cp:hasCoverageGrid ?grid ;
+                      cp:areaXMin ?ax0 ; cp:areaXMax ?ax1 ; cp:areaYMin ?ay0 ; cp:areaYMax ?ay1 .
+                ?req cp:hasAreaConfiguration ?area ; cp:minEpisodesPerCell ?min ; cp:hasTaskObject ?reqObj .
+                ?reqObj cp:name ?name .
+                ?axis cp:hasRequirement ?req .
+                ?dataset cp:hasGeneralizationAxis ?axis .
+                FILTER (?ax0 < ?ax1 && ?ay0 < ?ay1)
+                BIND (xsd:integer(FLOOR(?k / ?nw)) AS ?j)
+                BIND (?k - ?nw * ?j AS ?i)
+                BIND (?ax0 + ?i * (?ax1 - ?ax0) / ?nw AS ?x0)
+                BIND (IF(?i = ?nw - 1, ?ax1, ?ax0 + (?i + 1) * (?ax1 - ?ax0) / ?nw) AS ?x1)
+                BIND (?ay0 + ?j * (?ay1 - ?ay0) / ?nh AS ?y0)
+                BIND (IF(?j = ?nh - 1, ?ay1, ?ay0 + (?j + 1) * (?ay1 - ?ay0) / ?nh) AS ?y1)
+                BIND (ROUND(?x0 * 1000000) / 1000000 AS ?sx0)
+                BIND (ROUND(?x1 * 1000000) / 1000000 AS ?sx1)
+                BIND (ROUND(?y0 * 1000000) / 1000000 AS ?sy0)
+                BIND (ROUND(?y1 * 1000000) / 1000000 AS ?sy1)
+                OPTIONAL {
+                    ?episode cp:hasTaskObject ?obj .
+                    ?obj cp:name ?name ; cp:hasPosition ?p .
+                    ?p cp:positionX ?x ; cp:positionY ?y .
+                    FILTER (?x >= ?x0 && (?x < ?x1 || (?i = ?nw - 1 && ?x = ?x1)) &&
+                            ?y >= ?y0 && (?y < ?y1 || (?j = ?nh - 1 && ?y = ?y1)) &&
+                            EXISTS { ?dataset cp:hasEpisode ?episode . })
+                }
+            }
+            GROUP BY $this ?dataset ?name ?i ?j ?sx0 ?sx1 ?sy0 ?sy1 ?min
+            HAVING (COUNT(DISTINCT ?episode) < ?min)
+        """ ;
+    ] .
